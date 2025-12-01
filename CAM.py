@@ -18,8 +18,16 @@ class FaceReaderApp:
         self.current_frame = None # 현재 프레임 저장
 
         # OpenCV 얼굴 및 눈 감지기를 미리 로드 (haarcascade는 OpenCV 설치 시 함께 제공)
+        # Load primary and fallback face cascades to improve robustness
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.face_cascade_alt = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+
+        # If cascade loading failed for any reason, warn the user now
+        if self.face_cascade.empty() and self.face_cascade_alt.empty():
+            messagebox.showwarning("경고", "얼굴 검출용 Cascade 로드에 실패했습니다. OpenCV가 올바르게 설치되었는지 확인하세요.")
+        if self.eye_cascade.empty():
+            messagebox.showwarning("경고", "눈 검출용 Cascade 로드에 실패했습니다. 눈 검출 기능이 비활성화됩니다.")
         # 코와 입은 별도의 haarcascade가 없거나 정확도가 낮아, 여기서는 얼굴 영역 내에서 추정합니다.
         
         # UI 요소 생성
@@ -70,32 +78,36 @@ class FaceReaderApp:
             self.start_btn.config(state=tk.DISABLED)
             self.capture_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.NORMAL)
-            
-            # 스레드를 사용하여 카메라 피드를 비동기적으로 업데이트
-            self.video_thread = threading.Thread(target=self._update_video_feed, daemon=True)
-            self.video_thread.start()
+
+            # Use Tkinter's after() loop to update camera feed on the main thread
+            # (Safer than updating UI from a background thread)
+            self._update_video_feed()
 
     def _update_video_feed(self):
-        """웹캠에서 프레임을 읽어와 Canvas에 표시합니다."""
-        while self.is_running:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            
-            self.current_frame = frame # 현재 프레임 저장 (분석용)
-            
-            # OpenCV는 BGR 순서, Tkinter/PIL은 RGB 순서이므로 변환 필요
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
-            img_tk = ImageTk.PhotoImage(image=img)
+        """웹캠에서 프레임을 읽어와 Canvas에 표시합니다. Use Tkinter after loop."""
+        if not self.is_running or self.cap is None:
+            return
 
-            self.video_canvas.create_image(0, 0, image=img_tk, anchor=tk.NW)
-            self.video_canvas.image = img_tk # Tkinter가 이미지 가비지 컬렉션하지 않도록 참조 유지
-            
-            time.sleep(0.01) # 짧은 딜레이로 CPU 과부하 방지
+        ret, frame = self.cap.read()
+        if not ret:
+            # If frame not read, schedule retry
+            self.master.after(50, self._update_video_feed)
+            return
 
-        if self.cap:
-            self.cap.release()
+        self.current_frame = frame.copy() # 현재 프레임 저장 (분석용)
+
+        # OpenCV는 BGR 순서, Tkinter/PIL은 RGB 순서이므로 변환 필요
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        img_tk = ImageTk.PhotoImage(image=img)
+
+        # Clear previous image and draw the new one
+        self.video_canvas.delete("all")
+        self.video_canvas.create_image(0, 0, image=img_tk, anchor=tk.NW)
+        self.video_canvas.image = img_tk # Tkinter가 이미지 가비지 컬렉션하지 않도록 참조 유지
+
+        # Schedule next update
+        self.master.after(10, self._update_video_feed)
 
     def stop_camera(self):
         """웹캠 스트리밍을 정지합니다."""
@@ -123,16 +135,49 @@ class FaceReaderApp:
             return
 
         captured_frame = self.current_frame.copy()
-        
-        # 얼굴 감지 (흑백 이미지로 변환하여 감지 정확도 높임)
+
+        # Preprocess: convert to grayscale and apply histogram equalization for better lighting robustness
         gray = cv2.cvtColor(captured_frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        # Apply CLAHE (adaptive histogram equalization) for more robust contrast under varied lighting
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # Optionally resize for speed. We'll keep a scale factor to map back to original coords.
+        max_width = 800
+        h, w = gray.shape[:2]
+        scale = 1.0
+        if w > max_width:
+            scale = max_width / w
+            gray_resized = cv2.resize(gray, (int(w*scale), int(h*scale)))
+        else:
+            gray_resized = gray
+
+        # Determine a dynamic minSize (5% of width) to adapt to different image sizes
+        min_face_size = max(24, int(gray_resized.shape[1] * 0.05))
+
+        # Try primary cascade first and fallback to alternative cascade if no faces found
+        faces = self.face_cascade.detectMultiScale(gray_resized, scaleFactor=1.1, minNeighbors=5, minSize=(min_face_size, min_face_size))
+        if len(faces) == 0:
+            faces = self.face_cascade_alt.detectMultiScale(gray_resized, scaleFactor=1.1, minNeighbors=5, minSize=(min_face_size, min_face_size))
+
+        # If still no faces, retry with slightly looser parameters
+        if len(faces) == 0:
+            faces = self.face_cascade.detectMultiScale(gray_resized, scaleFactor=1.05, minNeighbors=4, minSize=(min_face_size//2, min_face_size//2))
 
         analysis_result = "분석 중...\n"
         if len(faces) == 0:
             analysis_result += "얼굴을 찾을 수 없습니다. 다시 시도해 주세요.\n"
         else:
+            # Overlay debug info: number of faces
+            cv2.putText(captured_frame, f"Faces: {len(faces)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             for (x, y, w, h) in faces:
+                # Map back to original coordinates if we resized the image
+                if scale != 1.0:
+                    x = int(x / scale)
+                    y = int(y / scale)
+                    w = int(w / scale)
+                    h = int(h / scale)
+
                 # 얼굴 영역 표시 (파란색 사각형)
                 cv2.rectangle(captured_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
                 
@@ -140,7 +185,8 @@ class FaceReaderApp:
                 roi_gray = gray[y:y+h, x:x+w]
                 roi_color = captured_frame[y:y+h, x:x+w]
                 
-                eyes = self.eye_cascade.detectMultiScale(roi_gray)
+                # 녹색 눈 네모 표시한다. 눈 검출 파라미터도 좀 더 세밀하게 조정
+                eyes = self.eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=4, minSize=(15, 15))
                 
                 eye_count = 0
                 for (ex, ey, ew, eh) in eyes:
@@ -166,7 +212,8 @@ class FaceReaderApp:
                     analysis_result += "- 갸름한 얼굴: 섬세하고 예술적인 기질이 있을 수 있습니다.\n"
                 
                 if eye_count >= 2: # 눈이 두 개 이상 감지되면
-                    if eyes[0][2] > 40: # 첫 번째 눈의 너비가 40픽셀 이상이면 (눈이 큰 편)
+                    # Guard access to eyes array
+                    if len(eyes) >= 1 and eyes[0][2] > 40: # 첫 번째 눈의 너비가 40픽셀 이상이면 (눈이 큰 편)
                         analysis_result += "- 큰 눈: 감성적이고 호기심이 많습니다.\n"
                     else:
                         analysis_result += "- 작은 눈: 신중하고 통찰력이 있습니다.\n"
