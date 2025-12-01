@@ -1,0 +1,10 @@
+# Requirements for running CAM.py
+# Recommended Python: 3.9+ (Windows/Mac/Linux)
+
+numpy>=1.24
+opencv-python>=4.7.0
+Pillow>=9.4.0
+
+# Optional (headless setup or advanced features):
+# opencv-python-headless>=4.7.0  # For headless servers without GUI
+# dlib>=19.24.0  # If you plan to use face_recognition/dlib later (requires build tools)
